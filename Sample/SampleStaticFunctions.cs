@@ -17,9 +17,14 @@ namespace MoleHill.EcsCommands.Sample
             paramX += 1;
             
         }
+        [System.Serializable]
+        public struct CustomStruct
+        {
+            public int x;
+        }
         
         [EcsStaticFunction(category: "Debug")]
-        public static void Spawn(World world, int count)
+        public static void Spawn(World world, int count,in EcsComponentAccess access, ref CustomStruct customStruct)
         {
             var em = world.EntityManager;
             var archetype = em.CreateArchetype();
@@ -35,9 +40,9 @@ namespace MoleHill.EcsCommands.Sample
                 allAccess: EcsComponentAccess.ReadOnly,
                 none: new[] { typeof(Disabled) }
             )]
-            Entity target,
-            ComponentLookup<LocalTransform> transformLookup,
-            [ReadOnly] ComponentLookup<Static> staticLookup)
+            in Entity target,
+            ref ComponentLookup<LocalTransform> transformLookup,
+            [ReadOnly]in ComponentLookup<Static> staticLookup)
         {
             if (transformLookup.TryGetRefRW(target, out var transform))
             {
@@ -54,9 +59,9 @@ namespace MoleHill.EcsCommands.Sample
                 allAccess: EcsComponentAccess.ReadOnly,
                 none: new[] { typeof(Disabled) }
             )]
-            Entity target,
-            ComponentLookup<LocalTransform> transformLookup,
-            [ReadOnly] ComponentLookup<Static> staticLookup)
+            in Entity target,
+            ref ComponentLookup<LocalTransform> transformLookup,
+            [ReadOnly] in ComponentLookup<Static> staticLookup)
         {
             if (transformLookup.TryGetRefRO(target, out var transform))
             {

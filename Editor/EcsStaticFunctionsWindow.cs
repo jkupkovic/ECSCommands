@@ -19,10 +19,37 @@ namespace MoleHill.EcsCommands.Editor
         [SerializeField] private string _selectedCategory = "All";
         private readonly List<string> _cachedCategories = new();
         
+        private const string FoldoutPrefsPrefix = "EcsStaticFnRunner.Foldout.";
+        private readonly Dictionary<string, bool> _foldouts = new();
+        
+
+        
         private readonly List<Command> _commands = new();
         private Vector2 _scroll;
         private string _search = "";
 
+        private static string GetCommandKey(MethodInfo m)
+        {
+            // stable-ish key across domain reloads: assembly + type + signature
+            return $"{m.DeclaringType?.Assembly.FullName}|{m.DeclaringType?.FullName}|{m}";
+        }
+        private void SetFoldout(MethodInfo m, bool value)
+        {
+            var key = GetCommandKey(m);
+            _foldouts[key] = value;
+            EditorPrefs.SetBool(FoldoutPrefsPrefix + key, value);
+        }
+        private bool GetFoldout(MethodInfo m)
+        {
+            var key = GetCommandKey(m);
+            if (_foldouts.TryGetValue(key, out var v))
+                return v;
+
+            v = EditorPrefs.GetBool(FoldoutPrefsPrefix + key, false);
+            _foldouts[key] = v;
+            return v;
+        }
+        
         [MenuItem("Tools/ECS/Static Functions")]
         public static void Open()
         {
@@ -61,6 +88,18 @@ namespace MoleHill.EcsCommands.Editor
 
                 DrawWorldDropdown();
                 DrawCategoryDropdown();
+                
+                if (GUILayout.Button("Expand All", EditorStyles.toolbarButton))
+                {
+                    foreach (var c in _commands)
+                        SetFoldout(c.Method, true);
+                }
+
+                if (GUILayout.Button("Collapse All", EditorStyles.toolbarButton))
+                {
+                    foreach (var c in _commands)
+                        SetFoldout(c.Method, false);
+                }
 
                 if (GUILayout.Button("Refresh", EditorStyles.toolbarButton, GUILayout.Width(70)))
                 {
@@ -212,7 +251,56 @@ namespace MoleHill.EcsCommands.Editor
             return result;
         }
         
-        private bool DrawEntityPicker(Command cmd, ParameterInfo p, string key, bool isIn)
+        private bool DrawEntityParam(Command cmd,ParameterInfo p, string key, bool isIn, bool isOut)
+        {
+            // out Entity = output only
+            if (isOut)
+            {
+                cmd.ParamValues.TryGetValue(key, out var outVal);
+                var e = outVal is Entity ent ? ent : Entity.Null;
+                using (new EditorGUI.DisabledScope(true))
+                    EditorGUILayout.TextField($"{key} (out Entity)", e == Entity.Null ? "Entity.Null" : $"({e.Index}:{e.Version})");
+                return true;
+            }
+
+            // in/ref/normal Entity = picker
+            // Reuse your existing DrawEntityPicker logic, just store into cmd.ParamValues[key]
+            return DrawEntityPickerForKey(cmd,p, key, isIn);
+        }
+        private static EntityQuery BuildEntityPickerQueryInline(EntityManager em, EcsEntityPickerAttribute? picker)
+        {
+            if (picker == null)
+                return em.UniversalQuery;
+
+            // Convert Type[] to ComponentType[] with ReadOnly/ReadWrite/Exclude
+            ComponentType[] ToCT(Type[] types, EcsComponentAccess access)
+            {
+                if (types == null || types.Length == 0) return Array.Empty<ComponentType>();
+                var arr = new ComponentType[types.Length];
+                for (int i = 0; i < types.Length; i++)
+                {
+                    var t = types[i];
+                    arr[i] = access switch
+                    {
+                        EcsComponentAccess.ReadOnly  => ComponentType.ReadOnly(t),
+                        EcsComponentAccess.ReadWrite => ComponentType.ReadWrite(t),
+                        EcsComponentAccess.Exclude   => ComponentType.Exclude(t),
+                        _ => ComponentType.ReadOnly(t)
+                    };
+                }
+                return arr;
+            }
+
+            var desc = new EntityQueryDesc
+            {
+                All  = ToCT(picker.All,  picker.AllAccess),
+                Any  = ToCT(picker.Any,  picker.AnyAccess),
+                None = ToCT(picker.None, EcsComponentAccess.Exclude)
+            };
+
+            return em.CreateEntityQuery(desc);
+        }
+        private bool DrawEntityPickerForKey(Command cmd,ParameterInfo p, string key, bool isIn)
         {
             if (_selectedWorld == null)
             {
@@ -223,13 +311,21 @@ namespace MoleHill.EcsCommands.Editor
 
             var em = _selectedWorld.EntityManager;
 
-            // Read attribute (optional)
-            var picker = p.GetCustomAttribute<EcsEntityPickerAttribute>();
-            EntityQuery query;
+            // Read current value
+            if (!cmd.ParamValues.TryGetValue(key, out var curObj) || curObj is not Entity current)
+                current = Entity.Null;
 
+            // Optional attribute filter
+            var picker = p.GetCustomAttribute<EcsEntityPickerAttribute>();
+
+            EntityQuery query;
             try
             {
-                query = BuildEntityPickerQuery(em, picker);
+                // If you already have this helper, keep using it:
+                // query = BuildEntityPickerQuery(em, picker);
+                //
+                // Otherwise use the inline version below (safe & simple):
+                query = BuildEntityPickerQueryInline(em, picker);
             }
             catch (Exception ex)
             {
@@ -238,14 +334,9 @@ namespace MoleHill.EcsCommands.Editor
                 return false;
             }
 
-            // NOTE: In editor GUI, keep allocations modest. This is simplest + correct.
-            using var entities = query.ToEntityArray(Unity.Collections.Allocator.Temp);
+            using var entities = query.ToEntityArray(Allocator.Temp);
 
-
-            if (!cmd.ParamValues.TryGetValue(key, out var currentObj) || currentObj is not Entity current)
-                current = Entity.Null;
-
-            // Build labels
+            // Build popup labels
             int count = entities.Length;
             var labels = new string[count + 1];
             labels[0] = "<None>";
@@ -256,7 +347,6 @@ namespace MoleHill.EcsCommands.Editor
             {
                 var e = entities[i];
 
-                // Prefer EntityManager name if available; fallback to index/version
                 string name = TryGetEntityName(em, e);
                 labels[i + 1] = string.IsNullOrEmpty(name)
                     ? $"Entity ({e.Index}:{e.Version})"
@@ -266,13 +356,21 @@ namespace MoleHill.EcsCommands.Editor
                     selectedIndex = i + 1;
             }
 
+            // Label includes modifier for clarity
             string label = $"{key} ({(isIn ? "in " : p.ParameterType.IsByRef ? "ref " : "")}Entity)";
+
             int newIndex = EditorGUILayout.Popup(label, selectedIndex, labels);
 
-            if (newIndex <= 0)
-                cmd.ParamValues[key] = Entity.Null;
-            else
-                cmd.ParamValues[key] = entities[newIndex - 1];
+            // Store selection
+            cmd.ParamValues[key] = (newIndex <= 0) ? Entity.Null : entities[newIndex - 1];
+
+            // If previous selection disappeared from query/world, show warning
+            if (current != Entity.Null && selectedIndex == 0)
+            {
+                EditorGUILayout.HelpBox(
+                    $"Previously selected entity is not present in the current World/query: ({current.Index}:{current.Version})",
+                    MessageType.Warning);
+            }
 
             return true;
         }
@@ -292,33 +390,69 @@ namespace MoleHill.EcsCommands.Editor
 
         private void DrawCommandCard(Command cmd)
         {
-            using (new EditorGUILayout.VerticalScope("box"))
+             using (new EditorGUILayout.VerticalScope("box"))
             {
-                EditorGUILayout.LabelField(cmd.DisplayName, EditorStyles.largeLabel);
+               // Header row: foldout + quick run (disabled if no world)
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    bool expanded = GetFoldout(cmd.Method);
 
-                var declaring = cmd.Method.DeclaringType != null
-                    ? cmd.Method.DeclaringType.FullName
-                    : "<unknown type>";
+                    bool newExpanded = EditorGUILayout.Foldout(
+                        expanded,
+                        cmd.DisplayName,
+                        toggleOnLabelClick: true,
+                        style: EditorStyles.foldoutHeader);
+
+                    if (newExpanded != expanded)
+                        SetFoldout(cmd.Method, newExpanded);
+
+                    GUILayout.FlexibleSpace();
+
+                    using (new EditorGUI.DisabledScope(_selectedWorld == null))
+                    {
+                        if (GUILayout.Button("Run", GUILayout.Width(60)))
+                            RunCommand(cmd);
+                    }
+                }
+
+                // Mini label always visible
+                var declaring = cmd.Method.DeclaringType != null ? cmd.Method.DeclaringType.FullName : "<unknown type>";
                 EditorGUILayout.LabelField(declaring, EditorStyles.miniLabel);
 
-                EditorGUILayout.Space(6);
-
-                // Params UI
-                var parameters = cmd.Method.GetParameters();
-
-                if (!TryGetFirstArgKind(cmd.Method, out var firstKind))
+                // When collapsed: show last result only (no "No World" warning here)
+                if (!GetFoldout(cmd.Method))
                 {
-                    EditorGUILayout.HelpBox("Unsupported first parameter. Use World, ref EntityManager, or ref EntityCommandBuffer.", MessageType.Error);
+                    if (cmd.LastResultMessage != null)
+                    {
+                        EditorGUILayout.Space(4);
+                        EditorGUILayout.HelpBox(cmd.LastResultMessage, cmd.LastResultType);
+                    }
                     return;
                 }
 
-// Show what is injected as first argument
+                // ✅ Only when expanded: show "No World selected" warning
+                if (_selectedWorld == null)
+                {
+                    EditorGUILayout.Space(6);
+                    EditorGUILayout.HelpBox("No World selected. Pick a World from the toolbar dropdown.", MessageType.Warning);
+                    return; // nothing else to render
+                }
+
+                EditorGUILayout.Space(6);
+
+                // ---- expanded UI continues below (injected info, parameters, run button, result, etc.) ----
+                if (!TryGetFirstArgKind(cmd.Method, out var firstKind))
+                {
+                    EditorGUILayout.HelpBox("Unsupported first parameter. Use World, ref EntityManager, ref EntityCommandBuffer, or ParallelWriter.", MessageType.Error);
+                    return;
+                }
+
                 string injected = firstKind switch
                 {
                     FirstArgKind.World => "Injected: World (from toolbar selection)",
                     FirstArgKind.RefEntityManager => "Injected: ref EntityManager (from selected World)",
-                    FirstArgKind.RefEntityCommandBuffer => "Injected: ref EntityCommandBuffer (auto-created; will Playback + Dispose)",
-                    FirstArgKind.RefEntityCommandBufferParallelWriter => "Injected: ref EntityCommandBuffer.ParallelWriter (auto-created; will Playback + Dispose ECB)",
+                    FirstArgKind.RefEntityCommandBuffer => "Injected: ref EntityCommandBuffer (auto-created; Playback + Dispose)",
+                    FirstArgKind.RefEntityCommandBufferParallelWriter => "Injected: ref EntityCommandBuffer.ParallelWriter (auto-created; Playback + Dispose)",
                     _ => "Injected: (unknown)"
                 };
 
@@ -326,7 +460,8 @@ namespace MoleHill.EcsCommands.Editor
 
                 bool canRun = _selectedWorld != null;
 
-// Draw ONLY parameters AFTER the injected first one
+                var parameters = cmd.Method.GetParameters();
+
                 if (parameters.Length <= 1)
                 {
                     EditorGUILayout.LabelField("No parameters.");
@@ -335,36 +470,35 @@ namespace MoleHill.EcsCommands.Editor
                 {
                     for (int i = 1; i < parameters.Length; i++)
                     {
-                        var p = parameters[i];
-                        
-                        if (IsAutoInjectedParam(p))
+                        var param = parameters[i];
+
+                        // injected lookups (including in/ref/out) => show disabled line
+                        if (IsInjectedLookup(param))
                         {
                             using (new EditorGUI.DisabledScope(true))
                             {
-                                // Show as disabled field for clarity
-                                EditorGUILayout.TextField(p.Name ?? p.ParameterType.Name, FriendlyLookupLabel(p));
+                                EditorGUILayout.TextField(
+                                    param.Name ?? StripByRef(param.ParameterType).Name,
+                                    BuildLookupInjectionMessage(param));
                             }
                             continue;
                         }
-                        
-                        
-                        if (!TryDrawParamField(cmd, p))
+
+                        if (!TryDrawParamField(cmd, param))
                             canRun = false;
                     }
                 }
 
                 EditorGUILayout.Space(8);
 
-                // Run
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     GUILayout.FlexibleSpace();
-                    using (new EditorGUI.DisabledScope(!canRun || _selectedWorld == null))
+
+                    using (new EditorGUI.DisabledScope(!canRun))
                     {
                         if (GUILayout.Button("Run", GUILayout.Width(120), GUILayout.Height(24)))
-                        {
                             RunCommand(cmd);
-                        }
                     }
                 }
 
@@ -376,24 +510,25 @@ namespace MoleHill.EcsCommands.Editor
             }
         }
 
+        
         private bool TryDrawParamField(Command cmd, ParameterInfo p)
         {
             var pt = p.ParameterType;
-
             bool isByRef = pt.IsByRef;
-            bool isOut = p.IsOut;                 // out T
-            bool isIn = p.IsIn && isByRef && !isOut; // in T (readonly ref)
+            bool isOut = p.IsOut;
+            bool isIn = p.IsIn && isByRef && !isOut;
+
             var elemType = isByRef ? pt.GetElementType()! : pt;
 
             // Auto-injected lookups are handled in the parameter loop (skip drawing).
             // If you don't skip them there, skip here too.
-            if (IsAutoInjectedParam(p))
+            if (IsInjectedLookup(p))
                 return true;
 
             var key = p.Name ?? elemType.Name;
 
             // out parameters: no user input, but we still show a line
-            if (isOut)
+            if (isOut && elemType != typeof(Entity))
             {
                 // Read whatever was written back after Run
                 cmd.ParamValues.TryGetValue(key, out var outVal);
@@ -412,49 +547,135 @@ namespace MoleHill.EcsCommands.Editor
             if (elemType == typeof(Entity))
             {
                 // For byref Entity we still store an Entity in ParamValues[key]
-                return DrawEntityPicker(cmd, p, key, isIn);
+                return DrawEntityParam(cmd,p, key, isIn, isOut);
             }
+           
 
             // Normal supported types (also works for in/ref on these)
             cmd.ParamValues.TryGetValue(key, out var current);
-
+            
+            string mod = isOut ? "out " : isIn ? "in " : isByRef ? "ref " : "";
+            string label = $"{key} ({mod}{elemType.Name})";
+            
             // For in parameters you can still edit what gets passed in (callee just can't write to it).
             // If you want in params to be non-editable, wrap DrawSupportedField in DisabledScope(true).
-            object? newValue = DrawSupportedField($"{key} ({(isIn ? "in " : isByRef ? "ref " : "")}{elemType.Name})", elemType, current);
+            object? newValue = DrawSupportedField(label, elemType, current);
 
             if (ReferenceEquals(newValue, Unsupported))
             {
+                if (elemType.IsValueType && !elemType.IsPrimitive && !elemType.IsEnum)
+                {
+                    object? boxed = current;
+                    if (TryDrawStructParam(cmd, key, elemType, ref boxed))
+                    {
+                        cmd.ParamValues[key] = boxed;
+                        return true;
+                    }
+                }
+
                 cmd.LastResultMessage =
-                    $"Unsupported parameter type: {(isByRef ? (isIn ? "in " : "ref ") : "")}{elemType.FullName}\n" +
-                    "Supported base types: int, float, double, bool, string, enums, Vector2/3/4, Quaternion, Color, UnityEngine.Object, Entity.\n" +
-                    "Also auto-injected: ComponentLookup<T>, BufferLookup<T>.";
+                    $"Unsupported parameter type: {elemType.FullName}\n\n" +
+                    "Supported:\n" +
+                    "- int, float, double, bool, string\n" +
+                    "- enums\n" +
+                    "- Vector2/3/4, Quaternion, Color\n" +
+                    "- UnityEngine.Object references\n" +
+                    "- Entity (incl. in/ref/out)\n" +
+                    "- custom structs (public fields and [SerializeField] private fields)\n" +
+                    "- auto-injected: ComponentLookup<T>, BufferLookup<T> (incl. in/ref/out)\n\n" +
+                    "Note: ref/in/out is supported for the above value types.";
                 cmd.LastResultType = MessageType.Warning;
                 return false;
             }
 
             cmd.ParamValues[key] = newValue;
-            if (isOut)
-{
-    // Read whatever was written back after Run
-    cmd.ParamValues.TryGetValue(key, out var outVal);
-
-    string shown = outVal == null
-        ? "null"
-        : outVal.ToString();
-
-    using (new EditorGUI.DisabledScope(true))
-        EditorGUILayout.TextField($"{key} (out {elemType.Name})", shown);
-
-    return true;
-}
             
+            return true;
+        }
+        
+        private bool TryDrawStructParam(Command cmd, string key, Type structType, ref object? value)
+        {
+            if (!structType.IsValueType || structType.IsPrimitive || structType.IsEnum)
+                return false;
+
+            // Ensure value exists
+            if (value == null || value.GetType() != structType)
+                value = Activator.CreateInstance(structType);
+
+            string foldKey = key + "|" + structType.FullName;
+            if (!cmd.StructFoldouts.TryGetValue(foldKey, out bool expanded))
+                expanded = false;
+
+            expanded = EditorGUILayout.Foldout(expanded, $"{key} ({structType.Name})", true);
+            cmd.StructFoldouts[foldKey] = expanded;
+
+            if (!expanded)
+                return true;
+
+            EditorGUI.indentLevel++;
+
+            object boxed = value; // boxed struct we will modify
+            bool anyChanged = false;
+
+            // Public instance fields + [SerializeField] private fields
+            var fields = structType.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .Where(f =>
+                    !f.IsStatic &&
+                    (f.IsPublic || f.GetCustomAttribute<SerializeField>() != null))
+                .OrderBy(f => f.MetadataToken);
+
+            foreach (var f in fields)
+            {
+                var ft = f.FieldType;
+                object? fieldVal = f.GetValue(boxed);
+
+                // Reuse your existing supported field drawer for primitives/enums/vectors/objects/etc.
+                var drawn = DrawSupportedField(f.Name, ft, fieldVal);
+
+                if (ReferenceEquals(drawn, Unsupported))
+                {
+                    // Nested struct support
+                    if (ft.IsValueType && !ft.IsPrimitive && !ft.IsEnum)
+                    {
+                        object? nested = fieldVal;
+                        if (!TryDrawStructParam(cmd, $"{key}.{f.Name}", ft, ref nested))
+                        {
+                            EditorGUILayout.LabelField($"{f.Name} ({ft.Name})", "Unsupported");
+                        }
+                        else
+                        {
+                            f.SetValue(boxed, nested);
+                            anyChanged = true;
+                        }
+                    }
+                    else
+                    {
+                        EditorGUILayout.LabelField($"{f.Name} ({ft.Name})", "Unsupported");
+                    }
+
+                    continue;
+                }
+
+                // Only write back if changed (simple compare)
+                if (!Equals(drawn, fieldVal))
+                {
+                    f.SetValue(boxed, drawn);
+                    anyChanged = true;
+                }
+            }
+
+            EditorGUI.indentLevel--;
+
+            if (anyChanged)
+                value = boxed; // write back modified struct
+
             return true;
         }
 
         private static bool UnsupportedParam(Command cmd, ParameterInfo p)
         {
             cmd.LastResultMessage = $"Unsupported parameter type: {p.ParameterType.FullName}\n" +
-                                    "Supported: int, float, double, bool, string, enums, Vector2/3/4, Quaternion, Color, UnityEngine.Object (references), " +
+                                    "Supported: int, float, double, bool, string, enums, float2/3/4, quaternion, Color, UnityEngine.Object (references), " +
                                     "plus auto-injected World / EntityManager.";
             cmd.LastResultType = MessageType.Warning;
             return false;
@@ -464,56 +685,63 @@ namespace MoleHill.EcsCommands.Editor
 
         private static object? DrawSupportedField(string label, Type t, object? current)
         {
-            if (t == typeof(int))
-                return EditorGUILayout.IntField(label, current is int i ? i : 0);
-
-            if (t == typeof(float))
-                return EditorGUILayout.FloatField(label, current is float f ? f : 0f);
-
-            if (t == typeof(double))
+            using (new EditorGUILayout.HorizontalScope())
             {
-                double d = current is double dd ? dd : 0d;
-                d = EditorGUILayout.DoubleField(label, d);
-                return d;
+                GUILayout.Label(label, GUILayout.Width(220));
+
+                if (t == typeof(int))
+                    return EditorGUILayout.IntField( current is int i ? i : 0);
+
+                if (t == typeof(float))
+                    return EditorGUILayout.FloatField( current is float f ? f : 0f);
+
+                if (t == typeof(double))
+                {
+                    double d = current is double dd ? dd : 0d;
+                    d = EditorGUILayout.DoubleField( d);
+                    return d;
+                }
+
+                if (t == typeof(bool))
+                    return EditorGUILayout.Toggle( current is bool b && b);
+
+                if (t == typeof(string))
+                    return EditorGUILayout.TextField( current as string ?? "");
+
+                if (t.IsEnum)
+                {
+                    var e = current != null && current.GetType() == t
+                        ? (Enum)current
+                        : (Enum)Enum.GetValues(t).GetValue(0)!;
+
+                    return EditorGUILayout.EnumPopup( e);
+                }
+
+                if (t == typeof(float2))
+                    return EditorGUILayout.Vector2Field(GUIContent.none, current is Vector2 v2 ? v2 : default);
+
+                if (t == typeof(float3))
+                    return EditorGUILayout.Vector3Field(GUIContent.none, current is Vector3 v3 ? v3 : default);
+
+                if (t == typeof(float4))
+                    return EditorGUILayout.Vector4Field(GUIContent.none, current is Vector4 v4 ? v4 : default);
+
+                if (t == typeof(quaternion) || t == typeof(Quaternion))
+                {
+                    var q = current is Quaternion qq ? qq : Quaternion.identity;
+                    // Show as Euler for usability
+                    var euler = EditorGUILayout.Vector3Field(GUIContent.none, q.eulerAngles);
+                    return Quaternion.Euler(euler);
+                }
+
+                if (t == typeof(Color))
+                    return EditorGUILayout.ColorField( current is Color c ? c : Color.white);
+
+                if (typeof(UnityEngine.Object).IsAssignableFrom(t))
+                    return EditorGUILayout.ObjectField( current as UnityEngine.Object, t,
+                        allowSceneObjects: true);
+
             }
-
-            if (t == typeof(bool))
-                return EditorGUILayout.Toggle(label, current is bool b && b);
-
-            if (t == typeof(string))
-                return EditorGUILayout.TextField(label, current as string ?? "");
-
-            if (t.IsEnum)
-            {
-                var e = current != null && current.GetType() == t
-                    ? (Enum)current
-                    : (Enum)Enum.GetValues(t).GetValue(0)!;
-
-                return EditorGUILayout.EnumPopup(label, e);
-            }
-
-            if (t == typeof(float2))
-                return EditorGUILayout.Vector2Field(label, current is Vector2 v2 ? v2 : default);
-
-            if (t == typeof(float3))
-                return EditorGUILayout.Vector3Field(label, current is Vector3 v3 ? v3 : default);
-
-            if (t == typeof(float4))
-                return EditorGUILayout.Vector4Field(label, current is Vector4 v4 ? v4 : default);
-
-            if (t == typeof(Quaternion))
-            {
-                var q = current is Quaternion qq ? qq : Quaternion.identity;
-                // Show as Euler for usability
-                var euler = EditorGUILayout.Vector3Field(label + " (Euler)", q.eulerAngles);
-                return Quaternion.Euler(euler);
-            }
-
-            if (t == typeof(Color))
-                return EditorGUILayout.ColorField(label, current is Color c ? c : Color.white);
-
-            if (typeof(UnityEngine.Object).IsAssignableFrom(t))
-                return EditorGUILayout.ObjectField(label, current as UnityEngine.Object, t, allowSceneObjects: true);
 
             return Unsupported;
         }
@@ -686,67 +914,66 @@ namespace MoleHill.EcsCommands.Editor
                 var p = ps[i];
                 var pt = p.ParameterType;
 
-                bool isByRef = pt.IsByRef;     // ref/out/in
+                bool isByRef = pt.IsByRef;
                 bool isOut = p.IsOut;
                 var elemType = isByRef ? pt.GetElementType()! : pt;
 
-                // Auto-inject lookups (by value)
-                if (!isByRef && (IsComponentLookupType(elemType) || IsBufferLookupType(elemType)))
+                // ✅ Inject lookups even if they are in/ref/out
+                if (IsComponentLookupType(elemType) || IsBufferLookupType(elemType))
                 {
-                    bool ro = IsReadOnlyParam(p);
+                    bool ro = EcsStaticFunctionsWindow.IsReadOnlyParam(p);
                     var genericArg = elemType.GetGenericArguments()[0];
 
                     if (IsComponentLookupType(elemType))
                     {
                         sysGetCompLookupDef ??= typeof(SystemBase)
                             .GetMethods(BindingFlags.Instance | BindingFlags.Public)
-                            .First(m =>
-                                m.Name == nameof(SystemBase.GetComponentLookup) &&
-                                m.IsGenericMethodDefinition &&
-                                m.GetParameters().Length == 1 &&
-                                m.GetParameters()[0].ParameterType == typeof(bool));
+                            .First(m => m.Name == nameof(SystemBase.GetComponentLookup)
+                                        && m.IsGenericMethodDefinition
+                                        && m.GetParameters().Length == 1
+                                        && m.GetParameters()[0].ParameterType == typeof(bool));
 
-                        args[i] = sysGetCompLookupDef.MakeGenericMethod(genericArg)
+                        var lookup = sysGetCompLookupDef.MakeGenericMethod(genericArg)
                             .Invoke(provider, new object[] { ro });
+
+                        // For out/ref/in, reflection still wants args[i] to contain a boxed value
+                        args[i] = lookup;
                         continue;
                     }
                     else
                     {
                         sysGetBuffLookupDef ??= typeof(SystemBase)
                             .GetMethods(BindingFlags.Instance | BindingFlags.Public)
-                            .First(m =>
-                                m.Name == nameof(SystemBase.GetBufferLookup) &&
-                                m.IsGenericMethodDefinition &&
-                                m.GetParameters().Length == 1 &&
-                                m.GetParameters()[0].ParameterType == typeof(bool));
+                            .First(m => m.Name == nameof(SystemBase.GetBufferLookup)
+                                        && m.IsGenericMethodDefinition
+                                        && m.GetParameters().Length == 1
+                                        && m.GetParameters()[0].ParameterType == typeof(bool));
 
-                        args[i] = sysGetBuffLookupDef.MakeGenericMethod(genericArg)
+                        var lookup = sysGetBuffLookupDef.MakeGenericMethod(genericArg)
                             .Invoke(provider, new object[] { ro });
+
+                        args[i] = lookup;
                         continue;
                     }
                 }
 
                 var key = p.Name ?? elemType.Name;
 
-                // out param: pass default placeholder
+                // out param placeholder (Entity handled via commit-back)
                 if (isOut)
                 {
                     args[i] = elemType.IsValueType ? Activator.CreateInstance(elemType) : null;
                     continue;
                 }
 
-                // normal / in / ref: load from UI values (or default)
+                // normal/in/ref values from UI (Entity picker already stores Entity)
                 if (!values.TryGetValue(key, out var v))
                 {
-                    if (elemType == typeof(Entity))
-                        v = Entity.Null;
-                    else if (p.HasDefaultValue)
-                        v = p.DefaultValue;
-                    else
-                        v = elemType.IsValueType ? Activator.CreateInstance(elemType) : null;
+                    if (elemType == typeof(Entity)) v = Entity.Null;
+                    else if (p.HasDefaultValue) v = p.DefaultValue;
+                    else v = elemType.IsValueType ? Activator.CreateInstance(elemType) : null;
                 }
 
-                // For ref/in parameters: still pass boxed value in args[i]
                 args[i] = v;
             }
 
@@ -772,19 +999,15 @@ namespace MoleHill.EcsCommands.Editor
         
         private static void CommitRefOutBack(Command cmd, MethodInfo method, object?[] args)
         {
-            var ps = method.GetParameters();
+             var ps = method.GetParameters();
 
-            // NOTE: start at 1 only if you *always* inject param0.
-            // If param0 can be user-managed ref/out, change start to 0.
             for (int i = 1; i < ps.Length; i++)
             {
                 var p = ps[i];
-                if (!p.ParameterType.IsByRef)
-                    continue;
+                if (!p.ParameterType.IsByRef) continue;
 
-                // 'in' is readonly; don't overwrite UI value
-                if (p.IsIn && !p.IsOut)
-                    continue;
+                // do not overwrite UI for `in`
+                if (p.IsIn && !p.IsOut) continue;
 
                 var elemType = p.ParameterType.GetElementType()!;
                 var key = p.Name ?? elemType.Name;
@@ -880,23 +1103,54 @@ namespace MoleHill.EcsCommands.Editor
 
 
         private static bool IsComponentLookupType(Type t)
-            => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(ComponentLookup<>);
+        {
+            t = StripByRef(t);
+            return t.IsGenericType && t.GetGenericTypeDefinition() == typeof(ComponentLookup<>);
+        }
 
         private static bool IsBufferLookupType(Type t)
-            => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(BufferLookup<>);
-        
-        private static bool IsAutoInjectedParam(ParameterInfo p)
         {
-            var t = p.ParameterType;
+            t = StripByRef(t);
+            return t.IsGenericType && t.GetGenericTypeDefinition() == typeof(BufferLookup<>);
+        }
+
+        private static bool IsInjectedLookup(ParameterInfo p)
+        {
+            var t = StripByRef(p.ParameterType);
             return IsComponentLookupType(t) || IsBufferLookupType(t);
         }
 
+        private static string ParamModifier(ParameterInfo p)
+        {
+            if (!p.ParameterType.IsByRef) return "";
+            if (p.IsOut) return "out ";
+            if (p.IsIn) return "in ";
+            return "ref ";
+        }
+        
         private static bool IsReadOnlyParam(ParameterInfo p)
         {
             // Unity.Collections.ReadOnlyAttribute
             return p.GetCustomAttribute<ReadOnlyAttribute>() != null;
         }
+        
+        private static Type StripByRef(Type t) => t.IsByRef ? t.GetElementType()! : t;
+        private static string BuildLookupInjectionMessage(ParameterInfo p)
+        {
+            var mod = ParamModifier(p);
+            var t = StripByRef(p.ParameterType);
+            var genericArg = t.GetGenericArguments()[0];
+            bool ro = IsReadOnlyParam(p);
 
+            string kind = IsComponentLookupType(t)
+                ? $"ComponentLookup<{genericArg.Name}>"
+                : $"BufferLookup<{genericArg.Name}>";
+
+            // Explicitly mention [ReadOnly]
+            return ro
+                ? $"Injected from selected World — {mod}{kind} with [ReadOnly]"
+                : $"Injected from selected World — {mod}{kind} (ReadWrite)";
+        }
         private static string SafeWorldName(World w)
         {
             try
@@ -915,7 +1169,8 @@ namespace MoleHill.EcsCommands.Editor
             public readonly string DisplayName;
             public readonly string? Category;
             public readonly Dictionary<string, object?> ParamValues = new();
-
+            public readonly Dictionary<string, bool> StructFoldouts = new();
+            
             public string? LastResultMessage;
             public MessageType LastResultType = MessageType.None;
 
