@@ -735,14 +735,14 @@ namespace MoleHill.EcsCommands.Editor
             if (!cmd.StructFoldouts.TryGetValue(foldKey, out bool expanded))
                 expanded = false;
 
-            EditorGUI.indentLevel++;
+            
             expanded = EditorGUILayout.Foldout(expanded, $"[CustomStruct] {key} ({structType.Name})", true);
             cmd.StructFoldouts[foldKey] = expanded;
 
             if (!expanded)
                 return true;
 
-
+            EditorGUI.indentLevel++;
             
 
             object boxed = value; // boxed struct we will modify
