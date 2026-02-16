@@ -2,6 +2,7 @@
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
+using Unity.Rendering;
 using Unity.Transforms;
 using UnityEngine;
 
@@ -49,10 +50,18 @@ namespace MoleHill.EcsCommands.Sample
                 transform.ValueRW.Position += new float3(0, 1, 0);
             }
         }
+
+        [EcsStaticFunction(category: "Debug")]
+        public static void CopyLocalTransform(World world,
+            [EcsFromEntityRef("From")]in LocalTransform from,
+            [EcsFromEntityRef("To",typeof(LocalToWorld))] ref LocalTransform to)
+        {
+            to = from;
+        }
         
         [EcsStaticFunction(category: "Debug")]
         public static void DoThingParallel(
-            ref EntityCommandBuffer.ParallelWriter ecb_pw,
+            this ref EntityCommandBuffer.ParallelWriter ecb_pw,
             in int sortKey,
             [EcsEntityPicker(
                 all:  new[] { typeof(LocalTransform), typeof(Static) },
@@ -63,6 +72,8 @@ namespace MoleHill.EcsCommands.Sample
             ref ComponentLookup<LocalTransform> transformLookup,
             [ReadOnly] in ComponentLookup<Static> staticLookup)
         {
+            if(target == Entity.Null)
+                throw new System.ArgumentNullException(nameof(target));
             if (transformLookup.TryGetRefRO(target, out var transform))
             {
                 var t = transform.ValueRO;

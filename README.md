@@ -71,6 +71,20 @@ The following parameter types are injected automatically using selected world:
 | `ComponentLookup<T>`                     | Injected via provider system             |
 | `BufferLookup<T>`                        | Injected via provider system             |
 
+### Component references
+
+Using attribute `EcsFromEntityRefAttribute` you are able to reference `IComponentData` of any entity with given component
+
+```csharp
+[EcsStaticFunction(category: "Debug")]
+public static void CopyLocalTransform(World world,
+    [EcsFromEntityRef("From")]in LocalTransform from,
+    [EcsFromEntityRef("To",typeof(LocalToWorld))] ref LocalTransform to)
+{
+    to = from;
+}
+```
+
 ### Supported Method Signatures
 
 First parameter must be one of:
@@ -88,6 +102,7 @@ Other parameters may include:
 - `Color`
 - `UnityEngine.Object`
 - `Entity`
+- Custom `structs` of type `IComponentData`
 - Custom `structs` (`public` fields & `[SerializeField]`)
 - `ComponentLookup<T>`
 - `BufferLookup<T>`

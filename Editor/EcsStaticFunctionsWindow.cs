@@ -390,9 +390,9 @@ namespace MoleHill.EcsCommands.Editor
 
         private void DrawCommandCard(Command cmd)
         {
-             using (new EditorGUILayout.VerticalScope("box"))
+            using (new EditorGUILayout.VerticalScope("box"))
             {
-               // Header row: foldout + quick run (disabled if no world)
+                // Header row: foldout + quick run (disabled if no world)
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     bool expanded = GetFoldout(cmd.Method);
@@ -430,20 +430,38 @@ namespace MoleHill.EcsCommands.Editor
                     return;
                 }
 
-                // ✅ Only when expanded: show "No World selected" warning
+                // ✅ Only when expanded: show "No World selected" warning (and stop)
                 if (_selectedWorld == null)
                 {
                     EditorGUILayout.Space(6);
                     EditorGUILayout.HelpBox("No World selected. Pick a World from the toolbar dropdown.", MessageType.Warning);
-                    return; // nothing else to render
+                    return;
+                }
+
+                // Entity References (only when world exists)
+                if (cmd.EntityRefAll.Count > 0)
+                {
+                    EditorGUILayout.Space(4);
+                    EditorGUILayout.LabelField("Entity References", EditorStyles.boldLabel);
+
+                    foreach (var kv in cmd.EntityRefAll.OrderBy(k => k.Key))
+                    {
+                        var refKey = kv.Key;
+                        var required = kv.Value;
+                        DrawEntityRefPicker(cmd, refKey, required);
+                    }
+
+                    EditorGUILayout.Space(6);
                 }
 
                 EditorGUILayout.Space(6);
 
-                // ---- expanded UI continues below (injected info, parameters, run button, result, etc.) ----
+                // ---- expanded UI continues below ----
                 if (!TryGetFirstArgKind(cmd.Method, out var firstKind))
                 {
-                    EditorGUILayout.HelpBox("Unsupported first parameter. Use World, ref EntityManager, ref EntityCommandBuffer, or ParallelWriter.", MessageType.Error);
+                    EditorGUILayout.HelpBox(
+                        "Unsupported first parameter. Use World, ref EntityManager, ref EntityCommandBuffer, or ref EntityCommandBuffer.ParallelWriter.",
+                        MessageType.Error);
                     return;
                 }
 
@@ -458,7 +476,7 @@ namespace MoleHill.EcsCommands.Editor
 
                 EditorGUILayout.HelpBox(injected, MessageType.None);
 
-                bool canRun = _selectedWorld != null;
+                bool canRun = true;
 
                 var parameters = cmd.Method.GetParameters();
 
@@ -472,18 +490,66 @@ namespace MoleHill.EcsCommands.Editor
                     {
                         var param = parameters[i];
 
-                        // injected lookups (including in/ref/out) => show disabled line
-                        if (IsInjectedLookup(param))
+                        // -------------------------
+                        // 1) EntityRef component/buffer params
+                        // -------------------------
+                        if (IsRefInjectedComponentOrBuffer(param))
                         {
-                            using (new EditorGUI.DisabledScope(true))
+                            var a = param.GetCustomAttribute<EcsFromEntityRefAttribute>();
+                            var elem = StripByRef(param.ParameterType);
+
+                            bool picked = a != null
+                                          && cmd.ParamValues.TryGetValue(EntityRefValueKey(a.Reference), out var eobj)
+                                          && eobj is Entity ent
+                                          && ent != Entity.Null;
+
+                            // If it's IComponentData and entity picked => draw actual value from selected entity
+                            if (picked && IsComponentDataType(elem))
                             {
-                                EditorGUILayout.TextField(
-                                    param.Name ?? StripByRef(param.ParameterType).Name,
-                                    BuildLookupInjectionMessage(param));
+                                if (!DrawComponentFromEntityRef(cmd, param))
+                                    canRun = false;
+
+                                continue;
                             }
+
+                            // If entity not picked => manual editing (your requirement)
+                            if (!picked)
+                            {
+                                if (!TryDrawParamField(cmd, param))
+                                    canRun = false;
+
+                                continue;
+                            }
+
+                            // Picked but not component data (likely DynamicBuffer) => keep injected display for now
+                            // (You can later add DrawBufferFromEntityRef similar to component)
+                            string mod = param.IsOut ? "out " : (param.IsIn ? "in " : (param.ParameterType.IsByRef ? "ref " : ""));
+                            string what =
+                                IsComponentDataType(elem)
+                                    ? $"{mod}{elem.Name}"
+                                    : $"{mod}DynamicBuffer<{GetBufferElementType(elem)!.Name}>";
+
+                            using (new EditorGUI.DisabledScope(true))
+                                EditorGUILayout.TextField(param.Name ?? elem.Name, $"Injected from EntityRef '{a.Reference}' → {what}");
+
                             continue;
                         }
 
+                        // -------------------------
+                        // 2) Injected lookups
+                        // -------------------------
+                        if (IsInjectedLookup(param))
+                        {
+                            using (new EditorGUI.DisabledScope(true))
+                                EditorGUILayout.TextField(
+                                    param.Name ?? StripByRef(param.ParameterType).Name,
+                                    BuildLookupInjectionMessage(param));
+                            continue;
+                        }
+
+                        // -------------------------
+                        // 3) Normal params
+                        // -------------------------
                         if (!TryDrawParamField(cmd, param))
                             canRun = false;
                     }
@@ -510,7 +576,70 @@ namespace MoleHill.EcsCommands.Editor
             }
         }
 
+        private void DrawEntityRefPicker(Command cmd, string refKey, HashSet<Type> requiredAll)
+        {
+            if (_selectedWorld == null)
+            {
+                EditorGUILayout.HelpBox($"EntityRef '{refKey}': No World selected.", MessageType.Warning);
+                return;
+            }
+
+            var em = _selectedWorld.EntityManager;
+
+            // Build query: ALL required types
+            var all = requiredAll
+                .Where(t => t != null)
+                .Select(ComponentType.ReadOnly)
+                .ToArray();
+
+            EntityQuery query = all.Length == 0
+                ? em.UniversalQuery
+                : em.CreateEntityQuery(new EntityQueryDesc { All = all });
+
+            using var entities = query.ToEntityArray(Allocator.Temp);
+
+            var storeKey = EntityRefValueKey(refKey);
+
+            if (!cmd.ParamValues.TryGetValue(storeKey, out var curObj) || curObj is not Entity current)
+                current = Entity.Null;
+
+            var labels = new string[entities.Length + 1];
+            labels[0] = $"<{refKey}: None>";
+
+            int selectedIndex = 0;
+            for (int i = 0; i < entities.Length; i++)
+            {
+                var e = entities[i];
+                string name = "";
+                try { name = em.GetName(e); } catch { /* ignore */ }
+
+                labels[i + 1] = string.IsNullOrEmpty(name)
+                    ? $"{refKey}: Entity ({e.Index}:{e.Version})"
+                    : $"{refKey}: {name} ({e.Index}:{e.Version})";
+
+                if (e == current) selectedIndex = i + 1;
+            }
+
+
+            int newIndex = EditorGUILayout.Popup($"Ref '{refKey}' Entity", selectedIndex, labels);
+
+            cmd.ParamValues[storeKey] = newIndex <= 0 ? Entity.Null : entities[newIndex - 1];
+        }
         
+        private static bool HasEntityRefAttr(ParameterInfo p, out EcsFromEntityRefAttribute attr)
+        {
+            attr = p.GetCustomAttribute<EcsFromEntityRefAttribute>();
+            return attr != null;
+        }
+
+        private static bool IsRefInjectedComponentOrBuffer(ParameterInfo p)
+        {
+            var attr = p.GetCustomAttribute<EcsFromEntityRefAttribute>();
+            if (attr == null) return false;
+
+            var elem = StripByRef(p.ParameterType);
+            return IsComponentDataType(elem) || IsDynamicBufferType(elem);
+        }
         private bool TryDrawParamField(Command cmd, ParameterInfo p)
         {
             var pt = p.ParameterType;
@@ -606,13 +735,15 @@ namespace MoleHill.EcsCommands.Editor
             if (!cmd.StructFoldouts.TryGetValue(foldKey, out bool expanded))
                 expanded = false;
 
-            expanded = EditorGUILayout.Foldout(expanded, $"{key} ({structType.Name})", true);
+            EditorGUI.indentLevel++;
+            expanded = EditorGUILayout.Foldout(expanded, $"[CustomStruct] {key} ({structType.Name})", true);
             cmd.StructFoldouts[foldKey] = expanded;
 
             if (!expanded)
                 return true;
 
-            EditorGUI.indentLevel++;
+
+            
 
             object boxed = value; // boxed struct we will modify
             bool anyChanged = false;
@@ -665,7 +796,7 @@ namespace MoleHill.EcsCommands.Editor
             }
 
             EditorGUI.indentLevel--;
-
+            
             if (anyChanged)
                 value = boxed; // write back modified struct
 
@@ -718,20 +849,91 @@ namespace MoleHill.EcsCommands.Editor
                 }
 
                 if (t == typeof(float2))
-                    return EditorGUILayout.Vector2Field(GUIContent.none, current is Vector2 v2 ? v2 : default);
+                {
+                    var v = current is float2 f ? f : default;
+                    var uv = new Vector2(v.x, v.y);
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        GUILayout.Label(GUIContent.none, GUILayout.Width(220));
+                        uv = EditorGUILayout.Vector2Field(GUIContent.none, uv);
+                    }
+                    return new float2(uv.x, uv.y);
+                }
 
                 if (t == typeof(float3))
-                    return EditorGUILayout.Vector3Field(GUIContent.none, current is Vector3 v3 ? v3 : default);
+                {
+                    var v = current is float3 f ? f : default;
+                    var uv = new Vector3(v.x, v.y, v.z);
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        GUILayout.Label(GUIContent.none, GUILayout.Width(220));
+                        uv = EditorGUILayout.Vector3Field(GUIContent.none, uv);
+                    }
+                    return new float3(uv.x, uv.y, uv.z);
+                }
 
                 if (t == typeof(float4))
-                    return EditorGUILayout.Vector4Field(GUIContent.none, current is Vector4 v4 ? v4 : default);
+                {
+                    var v = current is float4 f ? f : default;
+                    var uv = new Vector4(v.x, v.y, v.z, v.w);
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        GUILayout.Label(GUIContent.none, GUILayout.Width(220));
+                        uv = EditorGUILayout.Vector4Field(GUIContent.none, uv);
+                    }
+                    return new float4(uv.x, uv.y, uv.z, uv.w);
+                }
+                
+                if (t == typeof(int2))
+                {
+                    var v = current is int2 ii ? ii : default;
+                    var uv = new Vector2Int(v.x, v.y);
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        GUILayout.Label(GUIContent.none, GUILayout.Width(220));
+                        uv = EditorGUILayout.Vector2IntField(GUIContent.none, uv);
+                    }
+                    return new int2(uv.x, uv.y);
+                }
+
+                if (t == typeof(int3))
+                {
+                    var v = current is int3 ii ? ii : default;
+                    var uv = new Vector3Int(v.x, v.y, v.z);
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        GUILayout.Label(GUIContent.none, GUILayout.Width(220));
+                        uv = EditorGUILayout.Vector3IntField(GUIContent.none, uv);
+                    }
+                    return new int3(uv.x, uv.y, uv.z);
+                }
+
+                if (t == typeof(int4))
+                {
+                    var v = current is int4 ii ? ii : default;
+                    var uv = new Vector4(v.x, v.y, v.z, v.w);
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        GUILayout.Label(GUIContent.none, GUILayout.Width(220));
+                        uv = EditorGUILayout.Vector4Field(GUIContent.none, uv);
+                    }
+                    return new int4((int)uv.x, (int)uv.y, (int)uv.z, (int)uv.w);
+                }
 
                 if (t == typeof(quaternion) || t == typeof(Quaternion))
                 {
-                    var q = current is Quaternion qq ? qq : Quaternion.identity;
-                    // Show as Euler for usability
-                    var euler = EditorGUILayout.Vector3Field(GUIContent.none, q.eulerAngles);
-                    return Quaternion.Euler(euler);
+                    var q = current is quaternion mq ? mq : quaternion.identity;
+                    var uq = new Quaternion(q.value.x, q.value.y, q.value.z, q.value.w);
+                    var euler = uq.eulerAngles;
+
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        GUILayout.Label(GUIContent.none, GUILayout.Width(220));
+                        euler = EditorGUILayout.Vector3Field(GUIContent.none, euler);
+                    }
+
+                    var newUq = Quaternion.Euler(euler);
+                    return new quaternion(newUq.x, newUq.y, newUq.z, newUq.w);
                 }
 
                 if (t == typeof(Color))
@@ -807,12 +1009,12 @@ namespace MoleHill.EcsCommands.Editor
                 }
 
                 // Build args (inject first param based on signature)
-                var args = BuildArguments(cmd.Method, _selectedWorld, cmd.ParamValues, firstKind,  out var createdEcbForPlayback);
+                var args = BuildArguments(cmd,cmd.Method, _selectedWorld, cmd.ParamValues, firstKind,  out var createdEcbForPlayback);
 
                 // Invoke
                 var result = cmd.Method.Invoke(null, args);
                 CommitRefOutBack(cmd, cmd.Method, args);
-                
+                CommitEntityRefComponentWrites(cmd, _selectedWorld, cmd.Method, args); 
                 // If first arg is ref ECB, playback + dispose
                 if (createdEcbForPlayback.HasValue)
                 {
@@ -846,7 +1048,88 @@ namespace MoleHill.EcsCommands.Editor
             }
         }
 
+        private static MethodInfo GetSystemGetComponentLookupOpen()
+        {
+            var methods = typeof(SystemBase)
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .Where(m => m.Name == nameof(SystemBase.GetComponentLookup))
+                .Where(m => m.IsGenericMethodDefinition)
+                .Where(m => m.GetGenericArguments().Length == 1)
+                .ToArray();
+
+            // Prefer exact signature: GetComponentLookup<T>(bool)
+            var exact = methods.FirstOrDefault(m =>
+            {
+                var ps = m.GetParameters();
+                return ps.Length == 1 && ps[0].ParameterType == typeof(bool);
+            });
+
+            if (exact != null)
+                return exact;
+
+            // Fallback: any overload whose first parameter is bool (covers versions with extra optional params)
+            var boolFirst = methods.FirstOrDefault(m =>
+            {
+                var ps = m.GetParameters();
+                return ps.Length >= 1 && ps[0].ParameterType == typeof(bool);
+            });
+
+            if (boolFirst != null)
+                return boolFirst;
+
+            // Last resort: parameterless overload (if present in some version)
+            var parameterless = methods.FirstOrDefault(m => m.GetParameters().Length == 0);
+            if (parameterless != null)
+                return parameterless;
+
+            throw new MissingMethodException("Could not find a compatible SystemBase.GetComponentLookup<T>(...) overload.");
+        }
+        private static MethodInfo GetSystemGetBufferLookupOpen()
+        {
+            var methods = typeof(SystemBase)
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .Where(m => m.Name == nameof(SystemBase.GetBufferLookup))
+                .Where(m => m.IsGenericMethodDefinition)
+                .Where(m => m.GetGenericArguments().Length == 1)
+                .ToArray();
+
+            var exact = methods.FirstOrDefault(m =>
+            {
+                var ps = m.GetParameters();
+                return ps.Length == 1 && ps[0].ParameterType == typeof(bool);
+            });
+
+            if (exact != null)
+                return exact;
+
+            var boolFirst = methods.FirstOrDefault(m =>
+            {
+                var ps = m.GetParameters();
+                return ps.Length >= 1 && ps[0].ParameterType == typeof(bool);
+            });
+
+            if (boolFirst != null)
+                return boolFirst;
+
+            var parameterless = methods.FirstOrDefault(m => m.GetParameters().Length == 0);
+            if (parameterless != null)
+                return parameterless;
+
+            throw new MissingMethodException("Could not find a compatible SystemBase.GetBufferLookup<T>(...) overload.");
+        }
+
+        private static PropertyInfo GetIndexerItemEntityOrThrow(Type lookupType)
+            => lookupType
+                .GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .Single(pi =>
+                {
+                    if (pi.Name != "Item") return false;
+                    var idx = pi.GetIndexParameters();
+                    return idx.Length == 1 && idx[0].ParameterType == typeof(Entity);
+                });
+
         private static object?[] BuildArguments(
+            Command cmd,
             MethodInfo method,
             World world,
             Dictionary<string, object?> values,
@@ -858,7 +1141,6 @@ namespace MoleHill.EcsCommands.Editor
             var ps = method.GetParameters();
             var args = new object?[ps.Length];
 
-            // ---------- inject first argument ----------
             switch (firstKind)
             {
                 case FirstArgKind.World:
@@ -879,7 +1161,7 @@ namespace MoleHill.EcsCommands.Editor
                     createdEcbForPlayback = ecb;
                     break;
                 }
-                
+
                 case FirstArgKind.RefEntityCommandBufferParallelWriter:
                 {
                     var ecb = new EntityCommandBuffer(Allocator.TempJob);
@@ -892,96 +1174,152 @@ namespace MoleHill.EcsCommands.Editor
                     throw new ArgumentOutOfRangeException(nameof(firstKind), firstKind, null);
             }
 
-            // ---------- lookup provider system (public API) ----------
             var provider = world.GetOrCreateSystemManaged<EditorLookupProviderSystem>();
             provider.Update();
-
-            static bool IsComponentLookupType(Type t)
-                => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(ComponentLookup<>);
-
-            static bool IsBufferLookupType(Type t)
-                => t.IsGenericType && t.GetGenericTypeDefinition() == typeof(BufferLookup<>);
-
-            static bool IsReadOnlyParam(ParameterInfo p)
-                => p.GetCustomAttribute<ReadOnlyAttribute>() != null;
 
             MethodInfo? sysGetCompLookupDef = null;
             MethodInfo? sysGetBuffLookupDef = null;
 
-            // ---------- remaining args ----------
-            for (int i = 1; i < ps.Length; i++)
+            
+            
+            // Cache method infos once per call
+            var emGetCompOpen = GetEmGetComponentDataOpen();
+            var sysGetCompLookupOpen = GetSystemGetComponentLookupOpen();
+            var sysGetBuffLookupOpen = GetSystemGetBufferLookupOpen();
+
+           for (int i = 1; i < ps.Length; i++)
             {
                 var p = ps[i];
                 var pt = p.ParameterType;
 
                 bool isByRef = pt.IsByRef;
                 bool isOut = p.IsOut;
+                bool isIn = p.IsIn && isByRef && !isOut;
                 var elemType = isByRef ? pt.GetElementType()! : pt;
 
-                // ✅ Inject lookups even if they are in/ref/out
-                if (IsComponentLookupType(elemType) || IsBufferLookupType(elemType))
+                // ---------- 1) Auto-inject ComponentLookup<T> / BufferLookup<T> (supports in/ref/out) ----------
+                // We inject regardless of in/ref/out; 'out' can overwrite it if user code assigns.
+                var lookupBase = StripByRef(pt);
+                if (IsComponentLookupType(lookupBase) || IsBufferLookupType(lookupBase))
                 {
-                    bool ro = EcsStaticFunctionsWindow.IsReadOnlyParam(p);
-                    var genericArg = elemType.GetGenericArguments()[0];
+                    bool ro = IsReadOnlyParam(p);
+                    var genericArg = lookupBase.GetGenericArguments()[0];
 
-                    if (IsComponentLookupType(elemType))
+                    if (IsComponentLookupType(lookupBase))
                     {
-                        sysGetCompLookupDef ??= typeof(SystemBase)
-                            .GetMethods(BindingFlags.Instance | BindingFlags.Public)
-                            .First(m => m.Name == nameof(SystemBase.GetComponentLookup)
-                                        && m.IsGenericMethodDefinition
-                                        && m.GetParameters().Length == 1
-                                        && m.GetParameters()[0].ParameterType == typeof(bool));
-
-                        var lookup = sysGetCompLookupDef.MakeGenericMethod(genericArg)
+                        args[i] = sysGetCompLookupOpen
+                            .MakeGenericMethod(genericArg)
                             .Invoke(provider, new object[] { ro });
-
-                        // For out/ref/in, reflection still wants args[i] to contain a boxed value
-                        args[i] = lookup;
                         continue;
                     }
-                    else
+
+                    args[i] = sysGetBuffLookupOpen
+                        .MakeGenericMethod(genericArg)
+                        .Invoke(provider, new object[] { ro });
+                    continue;
+                }
+
+                // ---------- 2) EntityRef injection for IComponentData / DynamicBuffer<T> with MANUAL FALLBACK ----------
+                // If entity is NOT picked => do nothing here, fall through to normal/manual values.
+                var refAttr = p.GetCustomAttribute<EcsFromEntityRefAttribute>();
+                if (refAttr != null)
+                {
+                    var baseType = StripByRef(pt);
+
+                    if (IsComponentDataType(baseType) || IsDynamicBufferType(baseType))
                     {
-                        sysGetBuffLookupDef ??= typeof(SystemBase)
-                            .GetMethods(BindingFlags.Instance | BindingFlags.Public)
-                            .First(m => m.Name == nameof(SystemBase.GetBufferLookup)
-                                        && m.IsGenericMethodDefinition
-                                        && m.GetParameters().Length == 1
-                                        && m.GetParameters()[0].ParameterType == typeof(bool));
+                        bool picked = TryGetPickedEntity(cmd, refAttr.Reference, out var ent) && ent != Entity.Null;
 
-                        var lookup = sysGetBuffLookupDef.MakeGenericMethod(genericArg)
-                            .Invoke(provider, new object[] { ro });
+                        if (picked)
+                        {
+                            // out placeholder
+                            if (isOut)
+                            {
+                                args[i] = baseType.IsValueType ? Activator.CreateInstance(baseType) : null;
+                                continue;
+                            }
 
-                        args[i] = lookup;
-                        continue;
+                            // ---- IComponentData ----
+                            if (IsComponentDataType(baseType))
+                            {
+                                // If UI drew/edited a value from entity, prefer cached component value.
+                                // This allows "draw struct with values out of selected entity" and call with edited value.
+                                var cacheKey = EntityRefComponentCacheKey(refAttr.Reference, baseType);
+                                if (!isOut && values.TryGetValue(cacheKey, out var cached) && cached != null && cached.GetType() == baseType)
+                                {
+                                    args[i] = cached;
+                                    continue;
+                                }
+
+                                var gmi = emGetCompOpen.MakeGenericMethod(baseType);
+                                args[i] = gmi.Invoke(world.EntityManager, new object[] { ent });
+                                continue;
+                            }
+
+                            // ---- DynamicBuffer<T> ----
+                            if (IsDynamicBufferType(baseType))
+                            {
+                                bool ro = IsReadOnlyParam(p);
+                                var be = GetBufferElementType(baseType)!;
+
+                                var lookup = sysGetBuffLookupOpen
+                                    .MakeGenericMethod(be)
+                                    .Invoke(provider, new object[] { ro });
+
+                                var indexer = GetIndexerItemEntityOrThrow(lookup!.GetType());
+                                args[i] = indexer.GetValue(lookup, new object[] { ent });
+                                continue;
+                            }
+                        }
+
+                        // IMPORTANT: NOT picked -> fall through to normal/manual handling (no defaults, no continue)
                     }
                 }
 
+                // ---------- 3) Normal / manual parameters (supports in/ref/out) ----------
+                // key uses parameter name; this matches your UI storage for manual inputs.
                 var key = p.Name ?? elemType.Name;
 
-                // out param placeholder (Entity handled via commit-back)
+                // out: pass placeholder (reflection will write back into args[i])
                 if (isOut)
                 {
                     args[i] = elemType.IsValueType ? Activator.CreateInstance(elemType) : null;
                     continue;
                 }
 
-                // normal/in/ref values from UI (Entity picker already stores Entity)
+                // If user has entered a value, use it (also works for ref/in).
                 if (!values.TryGetValue(key, out var v))
                 {
-                    if (elemType == typeof(Entity)) v = Entity.Null;
-                    else if (p.HasDefaultValue) v = p.DefaultValue;
-                    else v = elemType.IsValueType ? Activator.CreateInstance(elemType) : null;
+                    // defaults if not provided
+                    if (elemType == typeof(Entity))
+                        v = Entity.Null;
+                    else if (p.HasDefaultValue)
+                        v = p.DefaultValue;
+                    else
+                        v = elemType.IsValueType ? Activator.CreateInstance(elemType) : null;
                 }
 
                 args[i] = v;
             }
 
             return args;
+            
         }
 
         private static object? GetDefault(Type t) => t.IsValueType ? Activator.CreateInstance(t) : null;
-        
+        private static bool TryGetPickedEntity(Command cmd, string refKey, out Entity e)
+        {
+            if (cmd.ParamValues.TryGetValue(EntityRefValueKey(refKey), out var obj) && obj is Entity ent)
+            {
+                e = ent;
+                return ent != Entity.Null;
+            }
+            e = Entity.Null;
+            return false;
+        }
+
+        private static bool IsDynamicBufferParam(ParameterInfo p) => IsDynamicBufferType(p.ParameterType);
+        private static bool IsComponentDataParam(ParameterInfo p) => IsComponentDataType(p.ParameterType);
         private static string FriendlyLookupLabel(ParameterInfo p)
         {
             var t = p.ParameterType;
@@ -1001,19 +1339,33 @@ namespace MoleHill.EcsCommands.Editor
         {
              var ps = method.GetParameters();
 
-            for (int i = 1; i < ps.Length; i++)
-            {
-                var p = ps[i];
-                if (!p.ParameterType.IsByRef) continue;
+            
+             for (int i = 1; i < ps.Length; i++)
+             {
+                 var p = ps[i];
+                 var pt = p.ParameterType;
 
-                // do not overwrite UI for `in`
-                if (p.IsIn && !p.IsOut) continue;
+                 if (!pt.IsByRef && !p.IsOut)
+                     continue;
 
-                var elemType = p.ParameterType.GetElementType()!;
-                var key = p.Name ?? elemType.Name;
+                 // 'in' is readonly; don't overwrite from args
+                 if (p.IsIn && !p.IsOut)
+                     continue;
 
-                cmd.ParamValues[key] = args[i];
-            }
+                 var elemType = StripByRef(pt);
+                 var normalKey = p.Name ?? elemType.Name;
+
+                 // 1) Always update the normal key so "ref struct" params update in UI
+                 cmd.ParamValues[normalKey] = args[i];
+
+                 // 2) If this param is EntityRef IComponentData, ALSO update the entity-ref cache key
+                 var refAttr = p.GetCustomAttribute<EcsFromEntityRefAttribute>();
+                 if (refAttr != null && typeof(IComponentData).IsAssignableFrom(elemType))
+                 {
+                     var cacheKey = EntityRefComponentCacheKey(refAttr.Reference, elemType);
+                     cmd.ParamValues[cacheKey] = args[i];
+                 }
+             }
         }
         private void RefreshCommands()
         {
@@ -1047,7 +1399,9 @@ namespace MoleHill.EcsCommands.Editor
                             ? $"{type.Name}.{method.Name}"
                             : attr.DisplayName!;
 
-                        _commands.Add(new Command(method, displayName, attr.Category));
+                        var newCmd = new Command(method, displayName, attr.Category);
+                        BuildEntityRefRequirements(newCmd);
+                        _commands.Add(newCmd);
                     }
                 }
             }
@@ -1071,7 +1425,47 @@ namespace MoleHill.EcsCommands.Editor
             if (!_cachedCategories.Contains(_selectedCategory))
                 _selectedCategory = "All";
         }
-        
+        private static void BuildEntityRefRequirements(Command cmd)
+        {
+            cmd.EntityRefAll.Clear();
+
+            var ps = cmd.Method.GetParameters();
+            for (int i = 0; i < ps.Length; i++)
+            {
+                var p = ps[i];
+                var attr = p.GetCustomAttribute<EcsFromEntityRefAttribute>();
+                if (attr == null) continue;
+
+                string refKey = attr.Reference;
+                if (!cmd.EntityRefAll.TryGetValue(refKey, out var set))
+                {
+                    set = new HashSet<Type>();
+                    cmd.EntityRefAll.Add(refKey, set);
+                }
+
+                // Add parameter-implied component requirement
+                var elem = StripByRef(p.ParameterType);
+
+                if (IsComponentDataType(elem))
+                {
+                    set.Add(elem);
+                }
+                else if (IsDynamicBufferType(elem))
+                {
+                    var be = GetBufferElementType(elem);
+                    if (be != null) set.Add(be);
+                }
+                else
+                {
+                    // You only wanted this behavior for IComponentData and DynamicBuffer<T>.
+                    // For other param types, we ignore the attribute (or you can warn).
+                }
+
+                // Add extra requirements
+                foreach (var t in attr.ExtraAll)
+                    if (t != null) set.Add(t);
+            }
+        }
         private void DrawCategoryDropdown()
         {
             string label = $"Category: {_selectedCategory}";
@@ -1090,7 +1484,34 @@ namespace MoleHill.EcsCommands.Editor
                 menu.ShowAsContext();
             }
         }
+        
+        private static void CommitEntityRefComponentWrites(Command cmd, World world, MethodInfo method, object?[] args)
+        {
+            var em = world.EntityManager;
+            var ps = method.GetParameters();
 
+            for (int i = 1; i < ps.Length; i++)
+            {
+                var p = ps[i];
+                var refAttr = p.GetCustomAttribute<EcsFromEntityRefAttribute>();
+                if (refAttr == null) continue;
+
+                var elem = StripByRef(p.ParameterType);
+                if (!IsComponentDataType(elem)) continue;             // only components write-back
+                if (!p.ParameterType.IsByRef && !p.IsOut) continue;   // only ref/out
+                if (p.IsIn && !p.IsOut) continue;                     // don't write back 'in'
+
+                if (!TryGetPickedEntity(cmd, refAttr.Reference, out var e))
+                    continue;
+
+                // args[i] contains updated boxed component for ref/out after Invoke
+                if (args[i] == null) continue;
+
+                var gmi = s_EmSetComponentDataOpen.MakeGenericMethod(elem);
+                gmi.Invoke(em, new object[] { e, args[i]! });
+            }
+        }
+        private static string EntityRefValueKey(string refKey) => $"@entityref:{refKey}";
         private void RefreshWorlds(bool selectFirstIfNull)
         {
             // World.All returns the current set of worlds (including Editor World in edit-mode).
@@ -1101,6 +1522,25 @@ namespace MoleHill.EcsCommands.Editor
                 _selectedWorld = worlds[0];
         }
 
+        private static bool IsDynamicBufferType(Type t)
+        {
+            t = StripByRef(t);
+            return t.IsGenericType && t.GetGenericTypeDefinition() == typeof(DynamicBuffer<>);
+        }
+
+        private static bool IsComponentDataType(Type t)
+        {
+            t = StripByRef(t);
+            return typeof(IComponentData).IsAssignableFrom(t);
+        }
+
+        private static Type? GetBufferElementType(Type t)
+        {
+            t = StripByRef(t);
+            if (!t.IsGenericType || t.GetGenericTypeDefinition() != typeof(DynamicBuffer<>))
+                return null;
+            return t.GetGenericArguments()[0];
+        }
 
         private static bool IsComponentLookupType(Type t)
         {
@@ -1151,6 +1591,8 @@ namespace MoleHill.EcsCommands.Editor
                 ? $"Injected from selected World — {mod}{kind} with [ReadOnly]"
                 : $"Injected from selected World — {mod}{kind} (ReadWrite)";
         }
+        private static string EntityRefComponentCacheKey(string refKey, Type compType)
+            => $"@entityrefcomp:{refKey}:{compType.AssemblyQualifiedName}";
         private static string SafeWorldName(World w)
         {
             try
@@ -1162,6 +1604,128 @@ namespace MoleHill.EcsCommands.Editor
                 return "<Disposed World>";
             }
         }
+        
+        
+        private static MethodInfo GetEmGetComponentDataOpen()
+        {
+            return typeof(EntityManager)
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .Single(m =>
+                {
+                    if (m.Name != "GetComponentData") return false;
+                    if (!m.IsGenericMethodDefinition) return false;
+                    if (m.GetGenericArguments().Length != 1) return false;
+
+                    var ps = m.GetParameters();
+                    return ps.Length == 1 && ps[0].ParameterType == typeof(Entity);
+                });
+        }
+        
+        private bool DrawComponentFromEntityRef(Command cmd, ParameterInfo p)
+        {
+            if (_selectedWorld == null) return false;
+
+            var refAttr = p.GetCustomAttribute<EcsFromEntityRefAttribute>();
+            if (refAttr == null) return false;
+
+            var pt = p.ParameterType;
+            bool isByRef = pt.IsByRef;
+            bool isOut = p.IsOut;
+            bool isIn = p.IsIn && isByRef && !isOut;
+
+            var compType = StripByRef(pt);
+            if (!typeof(IComponentData).IsAssignableFrom(compType))
+                return false;
+
+            // If EntityRef not picked => fall back to normal param drawer (manual editing)
+            if (!TryGetPickedEntity(cmd, refAttr.Reference, out var ent) || ent == Entity.Null)
+                return false;
+
+            var em = _selectedWorld.EntityManager;
+            var cacheKey = EntityRefComponentCacheKey(refAttr.Reference, compType);
+
+            // Refresh cached value when missing OR wrong type OR entity changed
+            // Track entity change using another key
+            var entKey = cacheKey + ":entity";
+            bool entityChanged = !cmd.ParamValues.TryGetValue(entKey, out var prevEntObj)
+                                 || prevEntObj is not Entity prevEnt
+                                 || prevEnt != ent;
+
+            if (entityChanged || !cmd.ParamValues.TryGetValue(cacheKey, out var cached) || cached == null || cached.GetType() != compType)
+            {
+                // Out param has no input value; show placeholder (read-only) until after Run
+                if (isOut)
+                {
+                    cmd.ParamValues[cacheKey] = Activator.CreateInstance(compType);
+                }
+                else
+                {
+                    var gmi = s_EmGetComponentDataOpen.MakeGenericMethod(compType);
+                    cmd.ParamValues[cacheKey] = gmi.Invoke(em, new object[] { ent });
+                }
+
+                cmd.ParamValues[entKey] = ent;
+            }
+
+            // Draw it
+            var label = $"{p.Name ?? compType.Name} ({(isOut ? "out " : isIn ? "in " : (isByRef ? "ref " : ""))}{compType.Name})";
+            object? value = cmd.ParamValues[cacheKey];
+
+            // in/out should be read-only in UI (out gets filled after Run)
+            using (new EditorGUI.DisabledScope(isIn || isOut))
+            {
+                // First try primitive/vector drawer, then struct drawer fallback
+                var drawn = DrawSupportedField(label, compType, value);
+                if (ReferenceEquals(drawn, Unsupported))
+                {
+                    var boxed = value;
+                    if (TryDrawStructParam(cmd, cacheKey, compType, ref boxed))
+                        cmd.ParamValues[cacheKey] = boxed;
+                    else
+                        EditorGUILayout.LabelField(label, "Unsupported");
+                }
+                else
+                {
+                    cmd.ParamValues[cacheKey] = drawn;
+                }
+            }
+
+            // Show where it came from
+            using (new EditorGUI.DisabledScope(true))
+                EditorGUILayout.TextField("Source", $"EntityRef '{refAttr.Reference}' → {ent.Index}:{ent.Version}");
+
+            return true; // we handled UI for this parameter
+        }
+
+        private static MethodInfo GetEmSetComponentDataOpen()
+        {
+            return typeof(EntityManager)
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .Single(m =>
+                {
+                    if (m.Name != "SetComponentData") return false;
+                    if (!m.IsGenericMethodDefinition) return false;
+                    if (m.GetGenericArguments().Length != 1) return false;
+
+                    var ps = m.GetParameters();
+                    return ps.Length == 2
+                           && ps[0].ParameterType == typeof(Entity)
+                           && ps[1].ParameterType.IsGenericParameter; // T
+                });
+        }
+
+        private static readonly MethodInfo s_EmGetComponentDataOpen =
+            typeof(EntityManager)
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .Single(m =>
+                {
+                    if (m.Name != "GetComponentData") return false;
+                    if (!m.IsGenericMethodDefinition) return false;
+                    if (m.GetGenericArguments().Length != 1) return false;
+                    var ps = m.GetParameters();
+                    return ps.Length == 1 && ps[0].ParameterType == typeof(Entity);
+                });
+        private static readonly MethodInfo s_EmSetComponentDataOpen = GetEmSetComponentDataOpen();
 
         private sealed class Command
         {
@@ -1170,6 +1734,7 @@ namespace MoleHill.EcsCommands.Editor
             public readonly string? Category;
             public readonly Dictionary<string, object?> ParamValues = new();
             public readonly Dictionary<string, bool> StructFoldouts = new();
+            public readonly Dictionary<string, HashSet<Type>> EntityRefAll = new(); 
             
             public string? LastResultMessage;
             public MessageType LastResultType = MessageType.None;
