@@ -58,6 +58,19 @@ namespace MoleHill.EcsCommands.Sample
         {
             to = from;
         }
+
+        [EcsStaticFunction(category: "Debug")]
+        public static void ResetChildTransforms(ref EntityCommandBuffer ecb,
+            in ComponentLookup<LocalTransform> transformLookup, 
+            [EcsFromEntityRef("Parent")]in DynamicBuffer<Child> children)
+        {
+            foreach (var child in children)
+            {
+                if(!transformLookup.HasComponent(child.Value))
+                    continue;
+                ecb.SetComponent(child.Value, new LocalTransform(){Scale = 1});
+            }
+        }
         
         [EcsStaticFunction(category: "Debug")]
         public static void DoThingParallel(
