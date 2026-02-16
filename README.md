@@ -14,6 +14,8 @@ Run ECS logic directly from the Editor with automatic dependency injection for:
 - `ref`, `in`, and `out` parameters (including `Entity` and Lookups)
 
 ## Features
+### Editor Window
+<img width="712" height="688" alt="image" src="https://github.com/user-attachments/assets/5c1f0f8b-c922-4429-9cab-458ff9952dde" />
 
 ### Static Function Exposure
 
