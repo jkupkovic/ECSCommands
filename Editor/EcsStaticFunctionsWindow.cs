@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using MoleHill.EcsCommands.Enums;
 using Unity.Collections;
 using Unity.Entities;
@@ -1376,6 +1377,10 @@ namespace MoleHill.EcsCommands.Editor
                         if (!TryGetFirstArgKind(method, out _))
                             continue;
 
+                        //Prevent duplicates
+                        if(new Regex("\\$BurstManaged$").IsMatch(method.Name))
+                            continue;
+                        
                         var displayName = string.IsNullOrWhiteSpace(attr.DisplayName)
                             ? $"{type.Name}.{method.Name}"
                             : attr.DisplayName!;
