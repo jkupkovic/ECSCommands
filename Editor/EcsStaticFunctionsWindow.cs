@@ -11,6 +11,7 @@ using UnityEngine;
 
 namespace MoleHill.EcsCommands.Editor
 {
+    #nullable enable
     public class EcsStaticFunctionsWindow : EditorWindow
     {
         // Requirement: "This world should be as variable in window class."
@@ -530,7 +531,7 @@ namespace MoleHill.EcsCommands.Editor
                                     : $"{mod}DynamicBuffer<{GetBufferElementType(elem)!.Name}>";
 
                             using (new EditorGUI.DisabledScope(true))
-                                EditorGUILayout.TextField(param.Name ?? elem.Name, $"Injected from EntityRef '{a.Reference}' → {what}");
+                                EditorGUILayout.TextField(param.Name ?? elem.Name, $"Injected from EntityRef '{a?.Reference}' → {what}");
 
                             continue;
                         }
@@ -1178,11 +1179,6 @@ namespace MoleHill.EcsCommands.Editor
 
             var provider = world.GetOrCreateSystemManaged<EditorLookupProviderSystem>();
             provider.Update();
-
-            MethodInfo? sysGetCompLookupDef = null;
-            MethodInfo? sysGetBuffLookupDef = null;
-
-            
             
             // Cache method infos once per call
             var emGetCompOpen = GetEmGetComponentDataOpen();

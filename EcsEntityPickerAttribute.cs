@@ -5,6 +5,7 @@ using MoleHill.EcsCommands.Enums;
 namespace MoleHill.EcsCommands
 {
 
+    #nullable enable
     [AttributeUsage(AttributeTargets.Parameter, AllowMultiple = false, Inherited = false)]
     public sealed class EcsEntityPickerAttribute : Attribute
     {

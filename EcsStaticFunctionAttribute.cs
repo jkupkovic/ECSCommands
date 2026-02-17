@@ -1,6 +1,7 @@
 using System;
 using UnityEngine;
 namespace MoleHill.EcsCommands {
+    #nullable enable
     [AttributeUsage(AttributeTargets.Method, AllowMultiple = false, Inherited = false)]
     public sealed class EcsStaticFunctionAttribute : Attribute
     {
