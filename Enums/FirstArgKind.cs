@@ -2,6 +2,7 @@
 {
     public enum FirstArgKind
     {
+        Other,
         World,
         RefEntityManager,
         RefEntityCommandBuffer,

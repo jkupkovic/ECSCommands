@@ -431,7 +431,7 @@ namespace MoleHill.EcsCommands.Editor
                     return;
                 }
 
-                // ✅ Only when expanded: show "No World selected" warning (and stop)
+                // Only when expanded: show "No World selected" warning (and stop)
                 if (_selectedWorld == null)
                 {
                     EditorGUILayout.Space(6);
@@ -475,19 +475,20 @@ namespace MoleHill.EcsCommands.Editor
                     _ => "Injected: (unknown)"
                 };
 
-                EditorGUILayout.HelpBox(injected, MessageType.None);
+                if(firstKind != FirstArgKind.Other)
+                    EditorGUILayout.HelpBox(injected, MessageType.None);
 
                 bool canRun = true;
 
                 var parameters = cmd.Method.GetParameters();
 
-                if (parameters.Length <= 1)
+                if (parameters.Length <= 0)
                 {
                     EditorGUILayout.LabelField("No parameters.");
                 }
                 else
                 {
-                    for (int i = 1; i < parameters.Length; i++)
+                    for (int i = firstKind == FirstArgKind.Other ? 0 : 1; i < parameters.Length; i++)
                     {
                         var param = parameters[i];
 
@@ -986,7 +987,8 @@ namespace MoleHill.EcsCommands.Editor
                 return true;
             }
 
-            return false;
+            kind = FirstArgKind.Other;
+            return true;
         }
         
         private void RunCommand(Command cmd)
@@ -1015,7 +1017,7 @@ namespace MoleHill.EcsCommands.Editor
                 // Invoke
                 var result = cmd.Method.Invoke(null, args);
                 CommitRefOutBack(cmd, cmd.Method, args);
-                CommitEntityRefComponentWrites(cmd, _selectedWorld, cmd.Method, args); 
+                CommitEntityRefComponentWrites(cmd, _selectedWorld, cmd.Method, args, firstKind == FirstArgKind.Other ? 0 : 1); 
                 // If first arg is ref ECB, playback + dispose
                 if (createdEcbForPlayback.HasValue)
                 {
@@ -1304,7 +1306,6 @@ namespace MoleHill.EcsCommands.Editor
             
         }
 
-        private static object? GetDefault(Type t) => t.IsValueType ? Activator.CreateInstance(t) : null;
         private static bool TryGetPickedEntity(Command cmd, string refKey, out Entity e)
         {
             if (cmd.ParamValues.TryGetValue(EntityRefValueKey(refKey), out var obj) && obj is Entity ent)
@@ -1316,23 +1317,6 @@ namespace MoleHill.EcsCommands.Editor
             return false;
         }
 
-        private static bool IsDynamicBufferParam(ParameterInfo p) => IsDynamicBufferType(p.ParameterType);
-        private static bool IsComponentDataParam(ParameterInfo p) => IsComponentDataType(p.ParameterType);
-        private static string FriendlyLookupLabel(ParameterInfo p)
-        {
-            var t = p.ParameterType;
-            var genericArg = t.IsGenericType ? t.GetGenericArguments()[0] : typeof(void);
-            var ro = IsReadOnlyParam(p) ? "ReadOnly" : "ReadWrite";
-
-            if (IsComponentLookupType(t))
-                return $"Injected: ComponentLookup<{genericArg.Name}> ({ro})";
-
-            if (IsBufferLookupType(t))
-                return $"Injected: BufferLookup<{genericArg.Name}> ({ro})";
-
-            return "Injected lookup";
-        }
-        
         private static void CommitRefOutBack(Command cmd, MethodInfo method, object?[] args)
         {
              var ps = method.GetParameters();
@@ -1389,7 +1373,6 @@ namespace MoleHill.EcsCommands.Editor
                         if (attr == null || !attr.ShowInWindow) continue;
                         if (!method.IsStatic || method.ContainsGenericParameters) continue;
 
-                        // REQUIRE: first param is World
                         if (!TryGetFirstArgKind(method, out _))
                             continue;
 
@@ -1483,12 +1466,12 @@ namespace MoleHill.EcsCommands.Editor
             }
         }
         
-        private static void CommitEntityRefComponentWrites(Command cmd, World world, MethodInfo method, object?[] args)
+        private static void CommitEntityRefComponentWrites(Command cmd, World world, MethodInfo method, object?[] args,int startIndex= 1)
         {
             var em = world.EntityManager;
             var ps = method.GetParameters();
-
-            for (int i = 1; i < ps.Length; i++)
+            
+            for (int i = startIndex; i < ps.Length; i++)
             {
                 var p = ps[i];
                 var refAttr = p.GetCustomAttribute<EcsFromEntityRefAttribute>();
@@ -1512,8 +1495,6 @@ namespace MoleHill.EcsCommands.Editor
         private static string EntityRefValueKey(string refKey) => $"@entityref:{refKey}";
         private void RefreshWorlds(bool selectFirstIfNull)
         {
-            // World.All returns the current set of worlds (including Editor World in edit-mode).
-            // See Unity DOTS discussions; World.All is commonly used for editor tools. :contentReference[oaicite:1]{index=1}
             var worlds = World.All;
             
             if (_selectedWorld == null && selectFirstIfNull && worlds.Count > 0)
@@ -1591,18 +1572,6 @@ namespace MoleHill.EcsCommands.Editor
         }
         private static string EntityRefComponentCacheKey(string refKey, Type compType)
             => $"@entityrefcomp:{refKey}:{compType.AssemblyQualifiedName}";
-        private static string SafeWorldName(World w)
-        {
-            try
-            {
-                return string.IsNullOrWhiteSpace(w.Name) ? "<Unnamed World>" : w.Name;
-            }
-            catch
-            {
-                return "<Disposed World>";
-            }
-        }
-        
         
         private static MethodInfo GetEmGetComponentDataOpen()
         {
