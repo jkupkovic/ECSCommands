@@ -1140,7 +1140,7 @@ namespace MoleHill.EcsCommands.Editor
 
             var ps = method.GetParameters();
             var args = new object?[ps.Length];
-
+            var startIndex = 1;
             switch (firstKind)
             {
                 case FirstArgKind.World:
@@ -1171,7 +1171,9 @@ namespace MoleHill.EcsCommands.Editor
                 }
 
                 default:
-                    throw new ArgumentOutOfRangeException(nameof(firstKind), firstKind, null);
+                    //throw new ArgumentOutOfRangeException(nameof(firstKind), firstKind, null);
+                    startIndex = 0;
+                    break;
             }
 
             var provider = world.GetOrCreateSystemManaged<EditorLookupProviderSystem>();
@@ -1187,7 +1189,7 @@ namespace MoleHill.EcsCommands.Editor
             var sysGetCompLookupOpen = GetSystemGetComponentLookupOpen();
             var sysGetBuffLookupOpen = GetSystemGetBufferLookupOpen();
 
-           for (int i = 1; i < ps.Length; i++)
+           for (int i = startIndex; i < ps.Length; i++)
             {
                 var p = ps[i];
                 var pt = p.ParameterType;
